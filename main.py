@@ -1,5 +1,8 @@
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import urllib.parse
 
 import requests
@@ -47,30 +50,44 @@ def _float_or_none(value):
     return None
 
 
-def _regional_row_for_timestamp(ts: str) -> dict | None:
-    r = requests.get(ODRE_REGION_URL, timeout=30)
-    r.raise_for_status()
-    rows = r.json().get("results") or []
+def _first_row_with_values(rows: list[dict], keys: tuple[str, ...]) -> dict | None:
     for row in rows:
-        if row.get("date_heure") == ts:
+        if any(row.get(k) is not None for k in keys):
             return row
     return None
+
+
+def _parse_odre_ts(ts: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _slot_age_hours(ts: str) -> float | None:
+    slot = _parse_odre_ts(ts)
+    if slot is None:
+        return None
+    now = datetime.now(timezone.utc)
+    if slot.tzinfo is None:
+        slot = slot.replace(tzinfo=timezone.utc)
+    return round((now - slot).total_seconds() / 3600, 1)
+
+
+def _fetch_odre_rows(url: str) -> list[dict]:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json().get("results") or []
 
 
 @app.get("/api/pulse")
 async def get_pulse():
     try:
-        response = requests.get(ODRE_METRO_URL, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data.get('results'):
+        metro_rows = _fetch_odre_rows(ODRE_METRO_URL)
+        if not metro_rows:
             raise HTTPException(status_code=404, detail="Data not available")
 
-        record = next(
-            (r for r in data["results"] if r.get("consommation") is not None),
-            None,
-        )
+        record = _first_row_with_values(metro_rows, ("consommation",))
         if record is None:
             raise HTTPException(
                 status_code=404,
@@ -78,34 +95,60 @@ async def get_pulse():
             )
 
         ts = record["date_heure"]
+        metro_age_h = _slot_age_hours(ts)
+
         regional = None
+        regional_renewables_row = None
         try:
-            regional = _regional_row_for_timestamp(ts)
+            regional_rows = _fetch_odre_rows(ODRE_REGION_URL)
+            regional = next(
+                (r for r in regional_rows if r.get("date_heure") == ts),
+                None,
+            )
+            # ODRE often leaves many trailing null rows; use the latest regional
+            # créneau that actually has EnR values (not locked to stale metro slot).
+            regional_renewables_row = _first_row_with_values(
+                regional_rows,
+                ("solaire", "eolien", "bioenergies"),
+            )
         except requests.RequestException:
-            regional = None
+            regional_rows = []
+
+        renew_row = regional_renewables_row or regional or {}
 
         # Métropole: consommation + échanges (eco2mix-metropoles-tr).
         consumption = _float_or_none(record.get("consommation")) or 0
         physical_exchanges = _float_or_none(record.get("echanges_physiques"))
 
-        # Renewables: from eco2mix-regional-tr (whole région, same time slot).
-        solar = _float_or_none((regional or {}).get("solaire"))
-        bio = _float_or_none((regional or {}).get("bioenergies"))
-        wind = _float_or_none((regional or {}).get("eolien"))
+        # Renewables: latest regional row with EnR data (may differ from metro slot).
+        solar = _float_or_none(renew_row.get("solaire"))
+        bio = _float_or_none(renew_row.get("bioenergies"))
+        wind = _float_or_none(renew_row.get("eolien"))
+        renewables_ts = renew_row.get("date_heure")
+        renewables_age_h = (
+            _slot_age_hours(renewables_ts) if renewables_ts else None
+        )
         renewables = [v for v in (solar, bio, wind) if v is not None]
         regional_renewables = sum(renewables) if renewables else None
 
-        autonomy_proxy = None
-        if regional_renewables is not None and consumption > 0:
-            autonomy_proxy = round((regional_renewables / consumption) * 100, 2)
-
-        return {
+        stale_after_h = 2.0
+        payload = {
             "city": "Métropole de Lyon",
             "timestamp": ts,
+            "renewables_timestamp": renewables_ts,
+            "freshness": {
+                "metro_slot_age_hours": metro_age_h,
+                "renewables_slot_age_hours": renewables_age_h,
+                "metro_stale": metro_age_h is not None and metro_age_h > stale_after_h,
+                "renewables_stale": renewables_age_h is not None
+                and renewables_age_h > stale_after_h,
+                "trailing_null_slots": sum(
+                    1 for r in metro_rows if r.get("consommation") is None
+                ),
+            },
             "metrics": {
                 "consumption_mw": consumption,
                 "regional_renewables_mw": regional_renewables,
-                "autonomy_proxy_percent": autonomy_proxy,
                 "physical_exchanges_mw": physical_exchanges,
             },
             "breakdown": {
@@ -125,12 +168,18 @@ async def get_pulse():
                 "renewables_geo": "Auvergne-Rhône-Alpes",
                 "join_key": "date_heure",
                 "regional_row_matched": regional is not None,
-                "autonomy_proxy_note": (
-                    "regional_renewables_mw / métropole consumption — "
-                    "different geographic scopes; illustrative only."
-                ),
+                "renewables_same_slot_as_metro": renewables_ts == ts,
             },
+            "story": (
+                "Affiche le dernier créneau de 15 minutes publié par ODRE pour la "
+                "consommation métropolitaine, et le dernier créneau régional avec "
+                "données EnR — pas une vue temps réel."
+            ),
         }
+        return JSONResponse(
+            content=payload,
+            headers={"Cache-Control": "no-store"},
+        )
     except HTTPException:
         raise
     except Exception as e:
